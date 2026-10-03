@@ -26,6 +26,7 @@ jobs:
         run: |
           flutter create --platforms=android --project-name sklad_bk --org ua.sklad.bk build_app
           rm -rf build_app/lib
+          rm -rf build_app/test
           cp -R lib build_app/lib
           cp pubspec.yaml build_app/pubspec.yaml
           cp analysis_options.yaml build_app/analysis_options.yaml
