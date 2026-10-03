@@ -186,14 +186,13 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _restoreBackup() async {
-    final result = await FilePicker.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: ['db'],
-      allowMultiple: false,
-    );
-    if (result == null || result.files.isEmpty) return;
+    final file = await FilePicker.pickFile(
+  type: FileType.custom,
+  allowedExtensions: ['db'],
+);
+if (file == null) return;
 
-    final sourcePath = result.files.single.path;
+final sourcePath = file.path;
     if (sourcePath == null || sourcePath.isEmpty) {
       _showError('Не удалось получить выбранный файл.');
       return;
