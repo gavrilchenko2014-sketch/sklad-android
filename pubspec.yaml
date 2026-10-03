@@ -1,10 +1,10 @@
 name: sklad_bk
 description: Offline mobile warehouse inventory app.
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.2.0+2
 
 environment:
-  sdk: '>=3.3.0 <4.0.0'
+  sdk: '>=3.4.0 <4.0.0'
 
 dependencies:
   flutter:
@@ -12,6 +12,9 @@ dependencies:
   cupertino_icons: ^1.0.8
   sqflite: ^2.4.0
   path: ^1.9.0
+  path_provider: ^2.1.5
+  share_plus: ^11.1.0
+  file_picker: ^11.0.3
 
 dev_dependencies:
   flutter_test:
