@@ -186,7 +186,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _restoreBackup() async {
-    final result = await FilePicker.platform.pickFiles(
+    final result = await FilePicker.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['db'],
       allowMultiple: false,
