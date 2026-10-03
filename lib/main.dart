@@ -1,4 +1,8 @@
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import 'database.dart';
 
@@ -51,9 +55,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _reload() async {
-    if (mounted) {
-      setState(() => _loading = true);
-    }
+    if (mounted) setState(() => _loading = true);
     final items = await WarehouseDatabase.instance.getItems(
       query: _searchController.text,
     );
@@ -62,6 +64,11 @@ class _HomeScreenState extends State<HomeScreen> {
       _items = items;
       _loading = false;
     });
+  }
+
+  Future<void> _refreshAll() async {
+    if (mounted) setState(() => _issuedRefresh++);
+    await _reload();
   }
 
   Future<void> _addItem() async {
@@ -80,18 +87,18 @@ class _HomeScreenState extends State<HomeScreen> {
         location: request.location,
         note: request.note,
       );
-      await _reload();
+      await _refreshAll();
     } catch (error) {
       if (!mounted) return;
       _showError(error.toString());
     }
   }
 
-  Future<void> _changeStock(InventoryItem item, bool incoming) async {
+  Future<void> _changeStock(InventoryItem item, StockAction action) async {
     final request = await showDialog<StockChangeRequest>(
       context: context,
       builder: (context) => StockChangeDialog(
-        incoming: incoming,
+        action: action,
         itemName: item.name,
         available: item.quantity,
         unit: item.unit,
@@ -99,20 +106,137 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     if (request == null) return;
 
+    final delta = switch (action) {
+      StockAction.incoming => request.quantity,
+      StockAction.outgoing => -request.quantity,
+      StockAction.returned => request.quantity,
+    };
+    final type = switch (action) {
+      StockAction.incoming => 'Приход',
+      StockAction.outgoing => 'Выдача',
+      StockAction.returned => 'Возврат',
+    };
+
     try {
       await WarehouseDatabase.instance.changeStock(
         itemId: item.id,
-        delta: incoming ? request.quantity : -request.quantity,
-        type: incoming ? 'Приход' : 'Выдача',
+        delta: delta,
+        type: type,
         recipient: request.recipient,
         note: request.note,
       );
-      if (!mounted) return;
-      setState(() => _issuedRefresh++);
-      await _reload();
+      await _refreshAll();
     } catch (error) {
       if (!mounted) return;
       _showError(error.toString().replaceFirst('Bad state: ', ''));
+    }
+  }
+
+  Future<void> _inventory(InventoryItem item) async {
+    final request = await showDialog<InventoryRequest>(
+      context: context,
+      builder: (context) => InventoryDialog(item: item),
+    );
+    if (request == null) return;
+
+    try {
+      await WarehouseDatabase.instance.setInventoryQuantity(
+        itemId: item.id,
+        actualQuantity: request.actualQuantity,
+        note: request.note,
+      );
+      await _refreshAll();
+    } catch (error) {
+      if (!mounted) return;
+      _showError(error.toString().replaceFirst('Bad state: ', ''));
+    }
+  }
+
+  Future<void> _openHistory() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (context) => const HistoryScreen()),
+    );
+    if (!mounted) return;
+    await _refreshAll();
+  }
+
+  Future<void> _createBackup() async {
+    try {
+      final tempDir = await getTemporaryDirectory();
+      final now = DateTime.now();
+      final fileName =
+          'sklad_backup_${now.year}${_two(now.month)}${_two(now.day)}_'
+          '${_two(now.hour)}${_two(now.minute)}.db';
+      final backup = await WarehouseDatabase.instance.createBackupFile(
+        p.join(tempDir.path, fileName),
+      );
+
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(backup.path)],
+          text: 'Резервная копия приложения «Склад»',
+          subject: 'Резервная копия склада',
+        ),
+      );
+      await _reload();
+    } catch (error) {
+      if (!mounted) return;
+      _showError('Не удалось создать резервную копию: $error');
+    }
+  }
+
+  Future<void> _restoreBackup() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['db'],
+      allowMultiple: false,
+    );
+    if (result == null || result.files.isEmpty) return;
+
+    final sourcePath = result.files.single.path;
+    if (sourcePath == null || sourcePath.isEmpty) {
+      _showError('Не удалось получить выбранный файл.');
+      return;
+    }
+
+    if (!mounted) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Восстановить копию?'),
+        content: const Text(
+          'Текущая база будет заменена данными из выбранной резервной копии.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Восстановить'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      await WarehouseDatabase.instance.restoreBackup(sourcePath);
+      _searchController.clear();
+      if (!mounted) return;
+      setState(() {
+        _selectedIndex = 0;
+        _issuedRefresh++;
+      });
+      await _reload();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Резервная копия восстановлена.')),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      _showError('Не удалось восстановить копию: $error');
     }
   }
 
@@ -130,14 +254,33 @@ class _HomeScreenState extends State<HomeScreen> {
         actions: [
           IconButton(
             tooltip: 'История операций',
-            onPressed: () {
-              Navigator.of(context).push(
-                MaterialPageRoute<void>(
-                  builder: (context) => const HistoryScreen(),
-                ),
-              );
-            },
+            onPressed: _openHistory,
             icon: const Icon(Icons.history),
+          ),
+          PopupMenuButton<String>(
+            tooltip: 'Ещё',
+            onSelected: (value) {
+              if (value == 'backup') _createBackup();
+              if (value == 'restore') _restoreBackup();
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(
+                value: 'backup',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.backup_outlined),
+                  title: Text('Создать резервную копию'),
+                ),
+              ),
+              PopupMenuItem(
+                value: 'restore',
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Icon(Icons.restore_page_outlined),
+                  title: Text('Восстановить из копии'),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -179,8 +322,10 @@ class _HomeScreenState extends State<HomeScreen> {
               _searchController.clear();
               _reload();
             },
-            onIncoming: (item) => _changeStock(item, true),
-            onOutgoing: (item) => _changeStock(item, false),
+            onIncoming: (item) => _changeStock(item, StockAction.incoming),
+            onOutgoing: (item) => _changeStock(item, StockAction.outgoing),
+            onReturn: (item) => _changeStock(item, StockAction.returned),
+            onInventory: _inventory,
           ),
           _IssuedTab(key: ValueKey(_issuedRefresh)),
         ],
@@ -188,6 +333,8 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 }
+
+enum StockAction { incoming, outgoing, returned }
 
 class _WarehouseTab extends StatelessWidget {
   const _WarehouseTab({
@@ -199,6 +346,8 @@ class _WarehouseTab extends StatelessWidget {
     required this.onClearSearch,
     required this.onIncoming,
     required this.onOutgoing,
+    required this.onReturn,
+    required this.onInventory,
   });
 
   final TextEditingController searchController;
@@ -209,6 +358,8 @@ class _WarehouseTab extends StatelessWidget {
   final VoidCallback onClearSearch;
   final void Function(InventoryItem item) onIncoming;
   final void Function(InventoryItem item) onOutgoing;
+  final void Function(InventoryItem item) onReturn;
+  final void Function(InventoryItem item) onInventory;
 
   @override
   Widget build(BuildContext context) {
@@ -298,8 +449,7 @@ class _WarehouseTab extends StatelessWidget {
                                     padding: const EdgeInsets.only(top: 3),
                                     child: Text(
                                       'Место: ${item.location}',
-                                      style:
-                                          Theme.of(context).textTheme.bodySmall,
+                                      style: Theme.of(context).textTheme.bodySmall,
                                     ),
                                   ),
                               ],
@@ -337,12 +487,29 @@ class _WarehouseTab extends StatelessWidget {
                           ),
                         ],
                       ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: FilledButton.tonalIcon(
+                              onPressed: () => onReturn(item),
+                              icon: const Icon(Icons.undo),
+                              label: const Text('Возврат'),
+                            ),
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: OutlinedButton.icon(
+                              onPressed: () => onInventory(item),
+                              icon: const Icon(Icons.fact_check_outlined),
+                              label: const Text('Инвентаризация'),
+                            ),
+                          ),
+                        ],
+                      ),
                       if (item.note.isNotEmpty) ...[
                         const Divider(height: 22),
-                        Text(
-                          item.note,
-                          style: Theme.of(context).textTheme.bodySmall,
-                        ),
+                        Text(item.note, style: Theme.of(context).textTheme.bodySmall),
                       ],
                     ],
                   ),
@@ -385,7 +552,6 @@ class _IssuedTab extends StatelessWidget {
           itemCount: movements.length,
           itemBuilder: (context, index) {
             final movement = movements[index];
-            final dateText = _formatDateTime(movement.createdAt);
             final recipient = movement.recipient.trim();
 
             return Card(
@@ -437,7 +603,7 @@ class _IssuedTab extends StatelessWidget {
                       children: [
                         const Icon(Icons.schedule, size: 20),
                         const SizedBox(width: 8),
-                        Text('Когда: $dateText'),
+                        Text('Когда: ${_formatDateTime(movement.createdAt)}'),
                       ],
                     ),
                     if (movement.note.isNotEmpty) ...[
@@ -502,10 +668,7 @@ class _EmptyState extends StatelessWidget {
         children: [
           const Icon(Icons.inventory_2_outlined, size: 56),
           const SizedBox(height: 12),
-          Text(
-            'Склад пока пуст',
-            style: Theme.of(context).textTheme.titleMedium,
-          ),
+          Text('Склад пока пуст', style: Theme.of(context).textTheme.titleMedium),
           const SizedBox(height: 4),
           const Text('Нажми «Добавить», чтобы создать первую позицию.'),
         ],
@@ -577,9 +740,7 @@ class _AddItemDialogState extends State<AddItemDialog> {
                         ),
                         validator: (value) {
                           final parsed = int.tryParse(value?.trim() ?? '');
-                          if (parsed == null || parsed < 0) {
-                            return 'Число ≥ 0';
-                          }
+                          if (parsed == null || parsed < 0) return 'Число ≥ 0';
                           return null;
                         },
                       ),
@@ -654,13 +815,13 @@ class NewItemRequest {
 class StockChangeDialog extends StatefulWidget {
   const StockChangeDialog({
     super.key,
-    required this.incoming,
+    required this.action,
     required this.itemName,
     required this.available,
     required this.unit,
   });
 
-  final bool incoming;
+  final StockAction action;
   final String itemName;
   final int available;
   final String unit;
@@ -685,8 +846,18 @@ class _StockChangeDialogState extends State<StockChangeDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final title = switch (widget.action) {
+      StockAction.incoming => 'Приход',
+      StockAction.outgoing => 'Выдача',
+      StockAction.returned => 'Возврат',
+    };
+    final needsPerson = widget.action != StockAction.incoming;
+    final personLabel = widget.action == StockAction.outgoing
+        ? 'Кому выдано *'
+        : 'От кого возвращено *';
+
     return AlertDialog(
-      title: Text(widget.incoming ? 'Приход' : 'Выдача'),
+      title: Text(title),
       content: SizedBox(
         width: 420,
         child: SingleChildScrollView(
@@ -715,24 +886,24 @@ class _StockChangeDialogState extends State<StockChangeDialog> {
                     if (parsed == null || parsed <= 0) {
                       return 'Укажи число больше 0';
                     }
-                    if (!widget.incoming && parsed > widget.available) {
+                    if (widget.action == StockAction.outgoing &&
+                        parsed > widget.available) {
                       return 'На складе только ${widget.available} ${widget.unit}';
                     }
                     return null;
                   },
                 ),
-                if (!widget.incoming)
+                if (needsPerson)
                   TextFormField(
                     controller: _recipient,
                     textCapitalization: TextCapitalization.words,
-                    decoration: const InputDecoration(
-                      labelText: 'Кому выдано *',
+                    decoration: InputDecoration(
+                      labelText: personLabel,
                       hintText: 'Фамилия, имя или подразделение',
                     ),
                     validator: (value) {
-                      if (!widget.incoming &&
-                          (value == null || value.trim().isEmpty)) {
-                        return 'Укажи, кому выдано';
+                      if (value == null || value.trim().isEmpty) {
+                        return 'Заполни это поле';
                       }
                       return null;
                     },
@@ -740,9 +911,7 @@ class _StockChangeDialogState extends State<StockChangeDialog> {
                 TextFormField(
                   controller: _note,
                   maxLines: 2,
-                  decoration: const InputDecoration(
-                    labelText: 'Примечание',
-                  ),
+                  decoration: const InputDecoration(labelText: 'Примечание'),
                 ),
               ],
             ),
@@ -760,7 +929,7 @@ class _StockChangeDialogState extends State<StockChangeDialog> {
             Navigator.of(context).pop(
               StockChangeRequest(
                 quantity: int.parse(_quantity.text.trim()),
-                recipient: widget.incoming ? '' : _recipient.text.trim(),
+                recipient: needsPerson ? _recipient.text.trim() : '',
                 note: _note.text.trim(),
               ),
             );
@@ -784,6 +953,100 @@ class StockChangeRequest {
   final String note;
 }
 
+class InventoryDialog extends StatefulWidget {
+  const InventoryDialog({super.key, required this.item});
+
+  final InventoryItem item;
+
+  @override
+  State<InventoryDialog> createState() => _InventoryDialogState();
+}
+
+class _InventoryDialogState extends State<InventoryDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _actual;
+  final _note = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _actual = TextEditingController(text: '${widget.item.quantity}');
+  }
+
+  @override
+  void dispose() {
+    _actual.dispose();
+    _note.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Инвентаризация'),
+      content: Form(
+        key: _formKey,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(widget.item.name),
+            const SizedBox(height: 4),
+            Text(
+              'Учётный остаток: ${widget.item.quantity} ${widget.item.unit}',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _actual,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              decoration: InputDecoration(
+                labelText: 'Фактически, ${widget.item.unit}',
+              ),
+              validator: (value) {
+                final parsed = int.tryParse(value?.trim() ?? '');
+                if (parsed == null || parsed < 0) return 'Укажи число ≥ 0';
+                return null;
+              },
+            ),
+            TextFormField(
+              controller: _note,
+              maxLines: 2,
+              decoration: const InputDecoration(labelText: 'Примечание'),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Отмена'),
+        ),
+        FilledButton(
+          onPressed: () {
+            if (!_formKey.currentState!.validate()) return;
+            Navigator.of(context).pop(
+              InventoryRequest(
+                actualQuantity: int.parse(_actual.text.trim()),
+                note: _note.text.trim(),
+              ),
+            );
+          },
+          child: const Text('Зафиксировать'),
+        ),
+      ],
+    );
+  }
+}
+
+class InventoryRequest {
+  const InventoryRequest({required this.actualQuantity, required this.note});
+
+  final int actualQuantity;
+  final String note;
+}
+
 class HistoryScreen extends StatefulWidget {
   const HistoryScreen({super.key});
 
@@ -792,12 +1055,76 @@ class HistoryScreen extends StatefulWidget {
 }
 
 class _HistoryScreenState extends State<HistoryScreen> {
-  late final Future<List<StockMovement>> _movements;
+  late Future<List<StockMovement>> _movements;
 
   @override
   void initState() {
     super.initState();
+    _reload();
+  }
+
+  void _reload() {
     _movements = WarehouseDatabase.instance.getMovements();
+  }
+
+  Future<void> _edit(StockMovement movement) async {
+    final request = await showDialog<EditMovementRequest>(
+      context: context,
+      builder: (context) => EditMovementDialog(movement: movement),
+    );
+    if (request == null) return;
+
+    try {
+      await WarehouseDatabase.instance.editMovement(
+        movementId: movement.id,
+        quantity: request.quantity,
+        recipient: request.recipient,
+        note: request.note,
+      );
+      if (!mounted) return;
+      setState(_reload);
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.toString().replaceFirst('Bad state: ', ''))),
+      );
+    }
+  }
+
+  Future<void> _delete(StockMovement movement) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Удалить операцию?'),
+        content: Text(
+          '${movement.type}: ${movement.itemName}, '
+          '${movement.quantity} ${movement.unit}.\n\n'
+          'Остаток на складе будет автоматически пересчитан.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      await WarehouseDatabase.instance.deleteMovement(movement.id);
+      if (!mounted) return;
+      setState(_reload);
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(error.toString().replaceFirst('Bad state: ', ''))),
+      );
+    }
   }
 
   @override
@@ -829,26 +1156,46 @@ class _HistoryScreenState extends State<HistoryScreen> {
                 '${movement.type} • ${_formatDateTime(movement.createdAt)}',
               ];
 
-              if (movement.type == 'Выдача' &&
+              if ((movement.type == 'Выдача' || movement.type == 'Возврат') &&
                   movement.recipient.trim().isNotEmpty) {
-                parts.add('Кому: ${movement.recipient.trim()}');
+                parts.add(
+                  movement.type == 'Выдача'
+                      ? 'Кому: ${movement.recipient.trim()}'
+                      : 'От кого: ${movement.recipient.trim()}',
+                );
               }
-              if (movement.note.isNotEmpty) {
-                parts.add(movement.note);
-              }
+              if (movement.note.isNotEmpty) parts.add(movement.note);
 
               return ListTile(
                 contentPadding: EdgeInsets.zero,
-                leading: Icon(
-                  movement.type == 'Выдача'
-                      ? Icons.remove_circle_outline
-                      : Icons.add_circle_outline,
-                ),
+                leading: Icon(_movementIcon(movement.type)),
                 title: Text(movement.itemName),
                 subtitle: Text(parts.join('\n')),
-                trailing: Text(
-                  '${movement.quantity} ${movement.unit}',
-                  style: Theme.of(context).textTheme.titleMedium,
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      _movementAmount(movement),
+                      style: Theme.of(context).textTheme.titleSmall,
+                    ),
+                    PopupMenuButton<String>(
+                      onSelected: (value) {
+                        if (value == 'edit') _edit(movement);
+                        if (value == 'delete') _delete(movement);
+                      },
+                      itemBuilder: (context) => [
+                        if (movement.canEdit)
+                          const PopupMenuItem(
+                            value: 'edit',
+                            child: Text('Исправить'),
+                          ),
+                        const PopupMenuItem(
+                          value: 'delete',
+                          child: Text('Удалить'),
+                        ),
+                      ],
+                    ),
+                  ],
                 ),
               );
             },
@@ -859,6 +1206,118 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 }
 
+class EditMovementDialog extends StatefulWidget {
+  const EditMovementDialog({super.key, required this.movement});
+
+  final StockMovement movement;
+
+  @override
+  State<EditMovementDialog> createState() => _EditMovementDialogState();
+}
+
+class _EditMovementDialogState extends State<EditMovementDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _quantity;
+  late final TextEditingController _recipient;
+  late final TextEditingController _note;
+
+  @override
+  void initState() {
+    super.initState();
+    _quantity = TextEditingController(text: '${widget.movement.quantity}');
+    _recipient = TextEditingController(text: widget.movement.recipient);
+    _note = TextEditingController(text: widget.movement.note);
+  }
+
+  @override
+  void dispose() {
+    _quantity.dispose();
+    _recipient.dispose();
+    _note.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final needsPerson =
+        widget.movement.type == 'Выдача' || widget.movement.type == 'Возврат';
+
+    return AlertDialog(
+      title: Text('Исправить: ${widget.movement.type}'),
+      content: Form(
+        key: _formKey,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: _quantity,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(
+                  labelText: 'Количество, ${widget.movement.unit}',
+                ),
+                validator: (value) {
+                  final parsed = int.tryParse(value?.trim() ?? '');
+                  if (parsed == null || parsed <= 0) return 'Укажи число > 0';
+                  return null;
+                },
+              ),
+              if (needsPerson)
+                TextFormField(
+                  controller: _recipient,
+                  decoration: InputDecoration(
+                    labelText: widget.movement.type == 'Выдача'
+                        ? 'Кому выдано *'
+                        : 'От кого возвращено *',
+                  ),
+                  validator: (value) => value == null || value.trim().isEmpty
+                      ? 'Заполни это поле'
+                      : null,
+                ),
+              TextFormField(
+                controller: _note,
+                maxLines: 2,
+                decoration: const InputDecoration(labelText: 'Примечание'),
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Отмена'),
+        ),
+        FilledButton(
+          onPressed: () {
+            if (!_formKey.currentState!.validate()) return;
+            Navigator.of(context).pop(
+              EditMovementRequest(
+                quantity: int.parse(_quantity.text.trim()),
+                recipient: needsPerson ? _recipient.text.trim() : '',
+                note: _note.text.trim(),
+              ),
+            );
+          },
+          child: const Text('Сохранить'),
+        ),
+      ],
+    );
+  }
+}
+
+class EditMovementRequest {
+  const EditMovementRequest({
+    required this.quantity,
+    required this.recipient,
+    required this.note,
+  });
+
+  final int quantity;
+  final String recipient;
+  final String note;
+}
+
 String _formatDateTime(DateTime value) {
   final date = value.toLocal();
   return '${_two(date.day)}.${_two(date.month)}.${date.year} '
@@ -866,3 +1325,21 @@ String _formatDateTime(DateTime value) {
 }
 
 String _two(int value) => value.toString().padLeft(2, '0');
+
+IconData _movementIcon(String type) {
+  return switch (type) {
+    'Выдача' => Icons.remove_circle_outline,
+    'Возврат' => Icons.undo,
+    'Инвентаризация' => Icons.fact_check_outlined,
+    _ => Icons.add_circle_outline,
+  };
+}
+
+String _movementAmount(StockMovement movement) {
+  if (movement.type == 'Инвентаризация') {
+    final sign = movement.delta > 0 ? '+' : '';
+    return '$sign${movement.delta} ${movement.unit}';
+  }
+  final sign = movement.delta < 0 ? '−' : '+';
+  return '$sign${movement.quantity} ${movement.unit}';
+}

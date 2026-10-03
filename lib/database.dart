@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
 
@@ -44,6 +46,7 @@ class StockMovement {
     required this.unit,
     required this.type,
     required this.quantity,
+    required this.delta,
     required this.recipient,
     required this.note,
     required this.createdAt,
@@ -55,9 +58,12 @@ class StockMovement {
   final String unit;
   final String type;
   final int quantity;
+  final int delta;
   final String recipient;
   final String note;
   final DateTime createdAt;
+
+  bool get canEdit => type == 'Приход' || type == 'Выдача' || type == 'Возврат';
 
   factory StockMovement.fromMap(Map<String, Object?> map) {
     return StockMovement(
@@ -67,8 +73,9 @@ class StockMovement {
       unit: map['unit'] as String? ?? '',
       type: map['type'] as String,
       quantity: map['quantity'] as int,
+      delta: map['delta'] as int? ?? 0,
       recipient: map['recipient'] as String? ?? '',
-      note: map['note'] as String,
+      note: map['note'] as String? ?? '',
       createdAt: DateTime.parse(map['created_at'] as String),
     );
   }
@@ -81,14 +88,17 @@ class WarehouseDatabase {
 
   Database? _database;
 
+  Future<String> get databasePath async {
+    return p.join(await getDatabasesPath(), 'warehouse.db');
+  }
+
   Future<Database> get database async {
     final current = _database;
     if (current != null) return current;
 
-    final dbPath = p.join(await getDatabasesPath(), 'warehouse.db');
     final opened = await openDatabase(
-      dbPath,
-      version: 2,
+      await databasePath,
+      version: 3,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -112,6 +122,7 @@ class WarehouseDatabase {
             item_id INTEGER NOT NULL,
             type TEXT NOT NULL,
             quantity INTEGER NOT NULL,
+            delta INTEGER NOT NULL DEFAULT 0,
             recipient TEXT NOT NULL DEFAULT '',
             note TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
@@ -133,11 +144,32 @@ class WarehouseDatabase {
             "ADD COLUMN recipient TEXT NOT NULL DEFAULT ''",
           );
         }
+        if (oldVersion < 3) {
+          await db.execute(
+            'ALTER TABLE stock_movements '
+            'ADD COLUMN delta INTEGER NOT NULL DEFAULT 0',
+          );
+          await db.execute('''
+            UPDATE stock_movements
+            SET delta = CASE
+              WHEN type = 'Выдача' THEN -quantity
+              ELSE quantity
+            END
+          ''');
+        }
       },
     );
 
     _database = opened;
     return opened;
+  }
+
+  Future<void> close() async {
+    final current = _database;
+    _database = null;
+    if (current != null && current.isOpen) {
+      await current.close();
+    }
   }
 
   Future<List<InventoryItem>> getItems({String query = ''}) async {
@@ -187,6 +219,7 @@ class WarehouseDatabase {
           'item_id': itemId,
           'type': 'Начальный остаток',
           'quantity': initialQuantity,
+          'delta': initialQuantity,
           'recipient': '',
           'note': '',
           'created_at': now,
@@ -208,19 +241,7 @@ class WarehouseDatabase {
 
     final db = await database;
     await db.transaction((txn) async {
-      final rows = await txn.query(
-        'inventory_items',
-        columns: ['quantity'],
-        where: 'id = ?',
-        whereArgs: [itemId],
-        limit: 1,
-      );
-
-      if (rows.isEmpty) {
-        throw StateError('Позиция не найдена.');
-      }
-
-      final current = rows.first['quantity'] as int;
+      final current = await _getCurrentQuantity(txn, itemId);
       final next = current + delta;
       if (next < 0) {
         throw StateError('Недостаточный остаток. Сейчас на складе: $current.');
@@ -237,10 +258,140 @@ class WarehouseDatabase {
         'item_id': itemId,
         'type': type,
         'quantity': delta.abs(),
+        'delta': delta,
         'recipient': recipient.trim(),
         'note': note.trim(),
         'created_at': DateTime.now().toIso8601String(),
       });
+    });
+  }
+
+  Future<void> setInventoryQuantity({
+    required int itemId,
+    required int actualQuantity,
+    String note = '',
+  }) async {
+    if (actualQuantity < 0) {
+      throw ArgumentError('Фактический остаток не может быть отрицательным.');
+    }
+
+    final db = await database;
+    await db.transaction((txn) async {
+      final current = await _getCurrentQuantity(txn, itemId);
+      final delta = actualQuantity - current;
+      final details = 'Было: $current → Факт: $actualQuantity';
+      final fullNote = note.trim().isEmpty ? details : '$details\n${note.trim()}';
+
+      await txn.update(
+        'inventory_items',
+        {'quantity': actualQuantity},
+        where: 'id = ?',
+        whereArgs: [itemId],
+      );
+
+      await txn.insert('stock_movements', {
+        'item_id': itemId,
+        'type': 'Инвентаризация',
+        'quantity': delta.abs(),
+        'delta': delta,
+        'recipient': '',
+        'note': fullNote,
+        'created_at': DateTime.now().toIso8601String(),
+      });
+    });
+  }
+
+  Future<void> editMovement({
+    required int movementId,
+    required int quantity,
+    required String recipient,
+    required String note,
+  }) async {
+    if (quantity <= 0) {
+      throw ArgumentError('Количество должно быть больше нуля.');
+    }
+
+    final db = await database;
+    await db.transaction((txn) async {
+      final rows = await txn.query(
+        'stock_movements',
+        where: 'id = ?',
+        whereArgs: [movementId],
+        limit: 1,
+      );
+      if (rows.isEmpty) throw StateError('Операция не найдена.');
+
+      final row = rows.first;
+      final type = row['type'] as String;
+      if (type != 'Приход' && type != 'Выдача' && type != 'Возврат') {
+        throw StateError('Эту операцию нельзя редактировать.');
+      }
+
+      final itemId = row['item_id'] as int;
+      final oldDelta = row['delta'] as int;
+      final newDelta = type == 'Выдача' ? -quantity : quantity;
+      final current = await _getCurrentQuantity(txn, itemId);
+      final next = current + (newDelta - oldDelta);
+      if (next < 0) {
+        throw StateError(
+          'После исправления остаток стал бы отрицательным. Текущий остаток: $current.',
+        );
+      }
+
+      await txn.update(
+        'inventory_items',
+        {'quantity': next},
+        where: 'id = ?',
+        whereArgs: [itemId],
+      );
+
+      await txn.update(
+        'stock_movements',
+        {
+          'quantity': quantity,
+          'delta': newDelta,
+          'recipient': recipient.trim(),
+          'note': note.trim(),
+        },
+        where: 'id = ?',
+        whereArgs: [movementId],
+      );
+    });
+  }
+
+  Future<void> deleteMovement(int movementId) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      final rows = await txn.query(
+        'stock_movements',
+        where: 'id = ?',
+        whereArgs: [movementId],
+        limit: 1,
+      );
+      if (rows.isEmpty) throw StateError('Операция не найдена.');
+
+      final row = rows.first;
+      final itemId = row['item_id'] as int;
+      final oldDelta = row['delta'] as int;
+      final current = await _getCurrentQuantity(txn, itemId);
+      final next = current - oldDelta;
+      if (next < 0) {
+        throw StateError(
+          'Нельзя удалить эту операцию: остаток стал бы отрицательным.',
+        );
+      }
+
+      await txn.update(
+        'inventory_items',
+        {'quantity': next},
+        where: 'id = ?',
+        whereArgs: [itemId],
+      );
+      await txn.delete(
+        'stock_movements',
+        where: 'id = ?',
+        whereArgs: [movementId],
+      );
     });
   }
 
@@ -257,6 +408,7 @@ class WarehouseDatabase {
         i.unit AS unit,
         m.type,
         m.quantity,
+        m.delta,
         m.recipient,
         m.note,
         m.created_at
@@ -271,5 +423,67 @@ class WarehouseDatabase {
 
   Future<List<StockMovement>> getIssuedMovements() {
     return getMovements(type: 'Выдача');
+  }
+
+  Future<File> createBackupFile(String targetPath) async {
+    await database;
+    await close();
+
+    final source = File(await databasePath);
+    if (!await source.exists()) {
+      throw StateError('Файл базы данных не найден.');
+    }
+
+    final target = File(targetPath);
+    if (await target.exists()) {
+      await target.delete();
+    }
+    return source.copy(targetPath);
+  }
+
+  Future<void> restoreBackup(String sourcePath) async {
+    final source = File(sourcePath);
+    if (!await source.exists()) {
+      throw StateError('Файл резервной копии не найден.');
+    }
+
+    Database? checkDb;
+    try {
+      checkDb = await openDatabase(sourcePath, readOnly: true);
+      final rows = await checkDb.rawQuery(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name IN ('inventory_items', 'stock_movements')",
+      );
+      final names = rows.map((row) => row['name']).toSet();
+      if (!names.contains('inventory_items') ||
+          !names.contains('stock_movements')) {
+        throw StateError('Это не резервная копия приложения «Склад».');
+      }
+    } finally {
+      await checkDb?.close();
+    }
+
+    await close();
+    final destinationPath = await databasePath;
+    final destination = File(destinationPath);
+    if (await destination.exists()) {
+      await destination.delete();
+    }
+    await source.copy(destinationPath);
+
+    // Открытие запускает миграцию, если резервная копия старой версии.
+    await database;
+  }
+
+  Future<int> _getCurrentQuantity(DatabaseExecutor txn, int itemId) async {
+    final rows = await txn.query(
+      'inventory_items',
+      columns: ['quantity'],
+      where: 'id = ?',
+      whereArgs: [itemId],
+      limit: 1,
+    );
+    if (rows.isEmpty) throw StateError('Позиция не найдена.');
+    return rows.first['quantity'] as int;
   }
 }
