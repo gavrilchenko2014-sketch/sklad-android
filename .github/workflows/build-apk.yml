@@ -1,0 +1,50 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Android wrapper
+        run: |
+          flutter create --platforms=android --project-name sklad_bk --org ua.sklad.bk build_app
+          rm -rf build_app/lib
+          cp -R lib build_app/lib
+          cp pubspec.yaml build_app/pubspec.yaml
+          cp analysis_options.yaml build_app/analysis_options.yaml
+
+      - name: Install dependencies
+        working-directory: build_app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: build_app
+        run: flutter analyze
+
+      - name: Build release APK
+        working-directory: build_app
+        run: flutter build apk --release
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sklad-android-apk
+          path: build_app/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 14
