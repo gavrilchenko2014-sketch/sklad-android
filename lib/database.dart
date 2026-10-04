@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
@@ -13,6 +14,7 @@ class InventoryItem {
     required this.location,
     required this.note,
     required this.createdAt,
+    this.photoBytes,
     this.isDeleted = false,
     this.deletedAt,
   });
@@ -25,6 +27,7 @@ class InventoryItem {
   final String location;
   final String note;
   final DateTime createdAt;
+  final Uint8List? photoBytes;
   final bool isDeleted;
   final DateTime? deletedAt;
 
@@ -39,6 +42,7 @@ class InventoryItem {
       location: map['location'] as String? ?? '',
       note: map['note'] as String? ?? '',
       createdAt: DateTime.parse(map['created_at'] as String),
+      photoBytes: map['photo'] as Uint8List?,
       isDeleted: (map['is_deleted'] as int? ?? 0) == 1,
       deletedAt: deletedAtRaw == null ? null : DateTime.parse(deletedAtRaw),
     );
@@ -170,7 +174,7 @@ class WarehouseDatabase {
 
     final opened = await openDatabase(
       await databasePath,
-      version: 4,
+      version: 5,
       onConfigure: (db) async {
         await db.execute('PRAGMA foreign_keys = ON');
       },
@@ -184,6 +188,7 @@ class WarehouseDatabase {
             unit TEXT NOT NULL DEFAULT 'шт.',
             location TEXT NOT NULL DEFAULT '',
             note TEXT NOT NULL DEFAULT '',
+            photo BLOB,
             created_at TEXT NOT NULL,
             is_deleted INTEGER NOT NULL DEFAULT 0,
             deleted_at TEXT
@@ -255,6 +260,11 @@ class WarehouseDatabase {
           );
           await db.execute(
             'ALTER TABLE inventory_items ADD COLUMN deleted_at TEXT',
+          );
+        }
+        if (oldVersion < 5) {
+          await db.execute(
+            'ALTER TABLE inventory_items ADD COLUMN photo BLOB',
           );
         }
       },
@@ -385,6 +395,20 @@ class WarehouseDatabase {
         'location': location.trim(),
         'note': note.trim(),
       },
+      where: 'id = ? AND is_deleted = 0',
+      whereArgs: [itemId],
+    );
+    if (changed == 0) throw StateError('Позиция не найдена.');
+  }
+
+  Future<void> updateItemPhoto({
+    required int itemId,
+    Uint8List? photoBytes,
+  }) async {
+    final db = await database;
+    final changed = await db.update(
+      'inventory_items',
+      {'photo': photoBytes},
       where: 'id = ? AND is_deleted = 0',
       whereArgs: [itemId],
     );
