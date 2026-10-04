@@ -31,7 +31,7 @@ jobs:
           cp pubspec.yaml build_app/pubspec.yaml
           cp analysis_options.yaml build_app/analysis_options.yaml
 
-          # v6: добавляем блокировку и новое меню резервных копий
+          # v6.1: защита приложения и новое меню резервных копий
           python3 tools/apply_v6.py build_app/lib/main.dart
 
           # local_auth требует FlutterFragmentActivity.
@@ -40,7 +40,6 @@ jobs:
 
           import android.os.Build
           import android.os.Bundle
-          import android.view.WindowManager
           import io.flutter.embedding.android.FlutterFragmentActivity
 
           class MainActivity: FlutterFragmentActivity() {
@@ -49,16 +48,6 @@ jobs:
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                       setRecentsScreenshotEnabled(false)
                   }
-              }
-
-              override fun onPause() {
-                  window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-                  super.onPause()
-              }
-
-              override fun onResume() {
-                  super.onResume()
-                  window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
               }
           }
           KOTLIN
