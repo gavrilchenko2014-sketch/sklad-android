@@ -71,27 +71,72 @@ class AppSecurityService {
     await _storage.write(key: _lockTimeoutKey, value: '$seconds');
   }
 
+  String? lastAuthError;
+
   Future<bool> canUseBiometrics() async {
     try {
-      if (!await _auth.canCheckBiometrics) return false;
+      final supported = await _auth.isDeviceSupported();
+      if (!supported) return false;
       final available = await _auth.getAvailableBiometrics();
-      return available.isNotEmpty;
+      return available.isNotEmpty || supported;
     } catch (_) {
       return false;
     }
   }
 
   Future<bool> authenticateBiometric() async {
+    lastAuthError = null;
     try {
+      // Небольшая пауза помогает некоторым оболочкам Android корректно
+      // открыть системный BiometricPrompt после нажатия на переключатель.
+      await Future<void>.delayed(const Duration(milliseconds: 250));
       return await _auth.authenticate(
-        localizedReason: 'Разблокировать приложение «Склад»',
-        biometricOnly: true,
+        localizedReason: 'Подтвердите вход в приложение «Склад»',
+        biometricOnly: false,
         persistAcrossBackgrounding: true,
+        sensitiveTransaction: true,
       );
-    } on LocalAuthException {
+    } on LocalAuthException catch (error) {
+      lastAuthError = _localAuthMessage(error);
       return false;
-    } catch (_) {
+    } catch (error) {
+      lastAuthError = 'Системная аутентификация не запустилась: $error';
       return false;
+    }
+  }
+
+  String _localAuthMessage(LocalAuthException error) {
+    switch (error.code) {
+      case LocalAuthExceptionCode.uiUnavailable:
+        return 'Android не смог открыть системное окно подтверждения.';
+      case LocalAuthExceptionCode.authInProgress:
+        return 'Проверка уже запущена. Подождите секунду и попробуйте снова.';
+      case LocalAuthExceptionCode.systemCanceled:
+        return 'Android отменил системное подтверждение. Попробуйте ещё раз.';
+      case LocalAuthExceptionCode.userCanceled:
+        return 'Подтверждение отменено.';
+      case LocalAuthExceptionCode.noCredentialsSet:
+        return 'На телефоне не настроена блокировка экрана.';
+      case LocalAuthExceptionCode.noBiometricsEnrolled:
+        return 'На телефоне не зарегистрирован отпечаток или другая биометрия.';
+      case LocalAuthExceptionCode.noBiometricHardware:
+        return 'Биометрический датчик недоступен.';
+      case LocalAuthExceptionCode.biometricHardwareTemporarilyUnavailable:
+        return 'Биометрический датчик временно недоступен.';
+      case LocalAuthExceptionCode.temporaryLockout:
+        return 'Биометрия временно заблокирована после неудачных попыток.';
+      case LocalAuthExceptionCode.biometricLockout:
+        return 'Сначала разблокируйте телефон его PIN-кодом или графическим ключом.';
+      case LocalAuthExceptionCode.userRequestedFallback:
+        return 'Выбран другой способ подтверждения.';
+      case LocalAuthExceptionCode.timeout:
+        return 'Время ожидания подтверждения истекло.';
+      case LocalAuthExceptionCode.deviceError:
+      case LocalAuthExceptionCode.unknownError:
+        final details = error.description?.trim();
+        return details == null || details.isEmpty
+            ? 'Ошибка системной аутентификации Android.'
+            : 'Ошибка Android: $details';
     }
   }
 
@@ -443,7 +488,8 @@ class _UnlockScreenState extends State<UnlockScreen> {
     }
     setState(() {
       _checking = false;
-      _error = 'Не удалось подтвердить отпечаток. Можно ввести PIN.';
+      _error = _security.lastAuthError ??
+          'Не удалось выполнить системное подтверждение. Можно ввести PIN.';
     });
   }
 
@@ -509,7 +555,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
                       child: OutlinedButton.icon(
                         onPressed: _checking ? null : _useBiometric,
                         icon: const Icon(Icons.fingerprint),
-                        label: const Text('Отпечаток / биометрия'),
+                        label: const Text('Отпечаток / системная защита'),
                       ),
                     ),
                   ],
@@ -562,8 +608,11 @@ class _SecuritySettingsScreenState extends State<SecuritySettingsScreen> {
       if (!mounted) return;
       if (!ok) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Биометрия не включена: подтверждение не прошло.'),
+          SnackBar(
+            content: Text(
+              _security.lastAuthError ??
+                  'Системная защита не включена: подтверждение не прошло.',
+            ),
           ),
         );
         return;
@@ -629,11 +678,11 @@ class _SecuritySettingsScreenState extends State<SecuritySettingsScreen> {
                     value: _biometricEnabled,
                     onChanged: _biometricAvailable ? _toggleBiometric : null,
                     secondary: const Icon(Icons.fingerprint),
-                    title: const Text('Отпечаток / биометрия'),
+                    title: const Text('Отпечаток / системная защита'),
                     subtitle: Text(
                       _biometricAvailable
-                          ? 'Разрешить быстрый вход через системную биометрию.'
-                          : 'На устройстве не найдена доступная биометрия.',
+                          ? 'Android предложит отпечаток, лицо или системный PIN/графический ключ.'
+                          : 'На устройстве недоступна системная защита.',
                     ),
                   ),
                 ),
